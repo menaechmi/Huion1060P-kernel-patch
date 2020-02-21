@@ -1,0 +1,143 @@
+From: menaechmi@protonmail.com
+
+This patch reverses the changes done by commit ef513be0a9057cc6baf5d29566aaaefa214ba344 to the kernel, and any subsequent calls to EP_CLEARING_TT. This is to allow users of Huion 1060Plus to use their tablets again.
+
+More work is needed to determine exactly which parts cause the tablet not to work, especially because it seems its the only device that has any issue with the update (potentially because few distros have updated to a kernel past 5.3 yet.)
+
+diff -uNr linux-5.5.5/drivers/usb/host/xhci.c linux-5.5.5-edited/drivers/usb/host/xhci.c
+--- a/drivers/usb/host/xhci.c	2020-02-19 12:54:14.000000000 -0600
++++ b/drivers/usb/host/xhci.c	2020-02-20 19:39:27.000000000 -0600
+@@ -3095,13 +3095,6 @@
+ 	if (!ep)
+ 		goto done;
+
+-	/* wait for hub_tt_work to finish clearing hub TT */
+-	if (ep->ep_state & EP_CLEARING_TT) {
+-		spin_unlock_irqrestore(&xhci->lock, flags);
+-		schedule_timeout_uninterruptible(1);
+-		goto rescan;
+-	}
+-
+ 	if (ep->ep_state)
+ 		xhci_dbg(xhci, "endpoint disable with ep_state 0x%x\n",
+ 			 ep->ep_state);
+@@ -5268,27 +5261,6 @@
+ }
+ EXPORT_SYMBOL_GPL(xhci_gen_setup);
+
+-static void xhci_clear_tt_buffer_complete(struct usb_hcd *hcd,
+-		struct usb_host_endpoint *ep)
+-{
+-	struct xhci_hcd *xhci;
+-	struct usb_device *udev;
+-	unsigned int slot_id;
+-	unsigned int ep_index;
+-	unsigned long flags;
+-
+-	xhci = hcd_to_xhci(hcd);
+-
+-	spin_lock_irqsave(&xhci->lock, flags);
+-	udev = (struct usb_device *)ep->hcpriv;
+-	slot_id = udev->slot_id;
+-	ep_index = xhci_get_endpoint_index(&ep->desc);
+-
+-	xhci->devs[slot_id]->eps[ep_index].ep_state &= ~EP_CLEARING_TT;
+-	xhci_ring_doorbell_for_active_rings(xhci, slot_id, ep_index);
+-	spin_unlock_irqrestore(&xhci->lock, flags);
+-}
+-
+ static const struct hc_driver xhci_hc_driver = {
+ 	.description =		"xhci-hcd",
+ 	.product_desc =		"xHCI Host Controller",
+@@ -5352,7 +5324,6 @@
+ 	.enable_usb3_lpm_timeout =	xhci_enable_usb3_lpm_timeout,
+ 	.disable_usb3_lpm_timeout =	xhci_disable_usb3_lpm_timeout,
+ 	.find_raw_port_number =	xhci_find_raw_port_number,
+-	.clear_tt_buffer_complete = xhci_clear_tt_buffer_complete,
+ };
+
+ void xhci_init_driver(struct hc_driver *drv,
+diff -uNr linux-5.5.5/drivers/usb/host/xhci.h linux-5.5.5-edited/drivers/usb/host/xhci.h
+--- a/drivers/usb/host/xhci.h	2020-02-19 12:54:14.000000000 -0600
++++ b/drivers/usb/host/xhci.h	2020-02-20 18:06:53.000000000 -0600
+@@ -936,8 +936,6 @@
+ #define EP_GETTING_NO_STREAMS	(1 << 5)
+ #define EP_HARD_CLEAR_TOGGLE	(1 << 6)
+ #define EP_SOFT_CLEAR_TOGGLE	(1 << 7)
+-/* usb_hub_clear_tt_buffer is in progress */
+-#define EP_CLEARING_TT		(1 << 8)
+ 	/* ----  Related to URB cancellation ---- */
+ 	struct list_head	cancelled_td_list;
+ 	/* Watchdog timer for stop endpoint command to cancel URBs */
+@@ -2114,9 +2112,6 @@
+
+ void xhci_ring_ep_doorbell(struct xhci_hcd *xhci, unsigned int slot_id,
+ 		unsigned int ep_index, unsigned int stream_id);
+-void xhci_ring_doorbell_for_active_rings(struct xhci_hcd *xhci,
+-		unsigned int slot_id,
+-		unsigned int ep_index);
+ void xhci_cleanup_command_queue(struct xhci_hcd *xhci);
+ void inc_deq(struct xhci_hcd *xhci, struct xhci_ring *ring);
+ unsigned int count_trbs(u64 addr, u64 len);
+diff -uNr linux-5.5.5/drivers/usb/host/xhci-ring.c linux-5.5.5-edited/drivers/usb/host/xhci-ring.c
+--- a/drivers/usb/host/xhci-ring.c	2020-02-19 12:54:14.000000000 -0600
++++ b/drivers/usb/host/xhci-ring.c	2020-02-20 18:03:13.000000000 -0600
+@@ -402,7 +402,7 @@
+ 	 * stream once the endpoint is on the HW schedule.
+ 	 */
+ 	if ((ep_state & EP_STOP_CMD_PENDING) || (ep_state & SET_DEQ_PENDING) ||
+-	    (ep_state & EP_HALTED) || (ep_state & EP_CLEARING_TT))
++	    (ep_state & EP_HALTED))
+ 		return;
+
+ 	trace_xhci_ring_ep_doorbell(slot_id, DB_VALUE(ep_index, stream_id));
+@@ -439,17 +439,7 @@
+ 	}
+ }
+
+-void xhci_ring_doorbell_for_active_rings(struct xhci_hcd *xhci,
+-		unsigned int slot_id,
+-		unsigned int ep_index)
+-{
+-	ring_doorbell_for_active_rings(xhci, slot_id, ep_index);
+-}
+
+-/* Get the right ring for the given slot_id, ep_index and stream_id.
+- * If the endpoint supports streams, boundary check the URB's stream ID.
+- * If the endpoint doesn't support streams, return the singular endpoint ring.
+- */
+ struct xhci_ring *xhci_triad_to_transfer_ring(struct xhci_hcd *xhci,
+ 		unsigned int slot_id, unsigned int ep_index,
+ 		unsigned int stream_id)
+@@ -1809,23 +1799,6 @@
+ 	return NULL;
+ }
+
+-static void xhci_clear_hub_tt_buffer(struct xhci_hcd *xhci, struct xhci_td *td,
+-		struct xhci_virt_ep *ep)
+-{
+-	/*
+-	 * As part of low/full-speed endpoint-halt processing
+-	 * we must clear the TT buffer (USB 2.0 specification 11.17.5).
+-	 */
+-	if (td->urb->dev->tt && !usb_pipeint(td->urb->pipe) &&
+-	    (td->urb->dev->tt->hub != xhci_to_hcd(xhci)->self.root_hub) &&
+-	    !(ep->ep_state & EP_CLEARING_TT)) {
+-		ep->ep_state |= EP_CLEARING_TT;
+-		td->urb->ep->hcpriv = td->urb->dev;
+-		if (usb_hub_clear_tt_buffer(td->urb))
+-			ep->ep_state &= ~EP_CLEARING_TT;
+-	}
+-}
+-
+ static void xhci_cleanup_halted_endpoint(struct xhci_hcd *xhci,
+ 		unsigned int slot_id, unsigned int ep_index,
+ 		unsigned int stream_id, struct xhci_td *td,
+@@ -1852,7 +1825,6 @@
+ 	if (reset_type == EP_HARD_RESET) {
+ 		ep->ep_state |= EP_HARD_CLEAR_TOGGLE;
+ 		xhci_cleanup_stalled_ring(xhci, ep_index, stream_id, td);
+-		xhci_clear_hub_tt_buffer(xhci, td, ep);
+ 	}
+ 	xhci_ring_cmd_db(xhci);
+ }
